@@ -1,11 +1,12 @@
 """
-Maltese Location Fuzzy Matching - For Vapi Python Execution
-Run this directly in Vapi as a Python code artifact
+Maltese Location Fuzzy Matching API - FULL VERSION
+For deployment to Render with src/main.py structure
 """
 
-import json
-
+from flask import Flask, jsonify, request
 from rapidfuzz import fuzz, process
+
+app = Flask(__name__)
 
 # All 68 Malta localities
 MALTA_LOCALITIES = {
@@ -119,9 +120,9 @@ MALTA_LOCALITIES = {
     "Comino": {"postcode": "CMN", "region": "Island", "phonetic": "KOM-ee-no"},
 }
 
-# Phonetic variant mapping
+# Phonetic variant mapping - maps common misspellings/accent variants to official names
 PHONETIC_VARIANTS = {
-    "shamsia": "Xemxija",
+    "shamsia": "Xemxija",  # "Shamsia" → Xemxija (shem-SHEE-yah)
     "shemsia": "Xemxija",
     "shemshia": "Xemxija",
     "kshem": "Xemxija",
@@ -134,9 +135,13 @@ def normalize_maltese(text):
     if not text:
         return ""
 
+    # Convert to lowercase and decompose
     text = text.lower().strip()
+
+    # Remove punctuation
     text = text.replace(".", "").replace(",", "").replace("!", "").replace("?", "")
 
+    # Maltese character mapping
     maltese_map = {
         "ż": "z",
         "ħ": "h",
@@ -155,153 +160,218 @@ def normalize_maltese(text):
     return text.strip()
 
 
-def fuzzy_match_location(user_input, context=None):
+@app.route("/api/fuzzy-match-location", methods=["POST"])
+def fuzzy_match_location():
     """Match user-spoken location to official Malta locality."""
+    try:
+        data = request.json or {}
+        user_input = data.get("input", "").strip()
 
-    if context is None:
-        context = {}
+        # Handle stt_confidence - can be number, string, or missing
+        stt_conf_raw = data.get("stt_confidence", 1.0)
+        try:
+            if isinstance(stt_conf_raw, str) and stt_conf_raw:
+                stt_confidence = float(stt_conf_raw)
+            elif stt_conf_raw:
+                stt_confidence = float(stt_conf_raw)
+            else:
+                stt_confidence = 1.0  # Default to high confidence
+        except (ValueError, TypeError):
+            stt_confidence = 1.0
 
-    user_input = user_input.strip() if user_input else ""
+        context = data.get("context", {})
 
-    if not user_input:
-        return {"error": "No input provided", "recommendation": "Provide location name"}
+        # Validate input
+        if not user_input:
+            return jsonify(
+                {
+                    "error": "No input provided",
+                    "recommendation": "Provide location name",
+                }
+            ), 400
 
-    # Normalize user input
-    normalized_input = normalize_maltese(user_input)
+        # Normalize user input
+        normalized_input = normalize_maltese(user_input)
 
-    if not normalized_input:
-        return {
-            "error": "Input became empty after normalization",
-            "user_input": user_input,
-        }
+        if not normalized_input:
+            return jsonify(
+                {
+                    "error": "Input became empty after normalization",
+                    "user_input": user_input,
+                }
+            ), 400
 
-    # Check phonetic variants first
-    if normalized_input in PHONETIC_VARIANTS:
-        official_name = PHONETIC_VARIANTS[normalized_input]
+        # CHECK PHONETIC VARIANTS FIRST - these are known problematic spellings
+        if normalized_input in PHONETIC_VARIANTS:
+            official_name = PHONETIC_VARIANTS[normalized_input]
+            locality_data = MALTA_LOCALITIES[official_name]
+            return jsonify(
+                {
+                    "location": official_name,
+                    "postcode": locality_data["postcode"],
+                    "region": locality_data["region"],
+                    "phonetic": locality_data["phonetic"],
+                    "confidence": 95,  # High confidence for known variant
+                    "stt_confidence": stt_confidence,
+                    "recommendation": "Confirm location with user",
+                }
+            )
+
+        # Get all locality names and normalize them
+        localities = list(MALTA_LOCALITIES.keys())
+        normalized_localities = [normalize_maltese(loc) for loc in localities]
+
+        # Use RapidFuzz - Token Set Ratio is best for partial/fuzzy matches
+        matches = process.extract(
+            normalized_input,
+            normalized_localities,
+            scorer=fuzz.TokenSetRatio,  # Better for word-by-word matching
+            limit=5,
+            score_cutoff=50,  # Lower cutoff to get candidates
+        )
+
+        # Also try Jaro-Winkler for phonetic matching
+        jw_matches = process.extract(
+            normalized_input,
+            normalized_localities,
+            scorer=fuzz.JaroWinkler,
+            limit=5,
+            score_cutoff=50,
+        )
+
+        # Take best from both methods
+        all_matches = matches + jw_matches
+
+        if not all_matches:
+            return jsonify(
+                {
+                    "location": None,
+                    "confidence": 0,
+                    "stt_confidence": stt_confidence,
+                    "message": "No locations found",
+                }
+            )
+
+        # Get best match
+        best_match_normalized, score = all_matches[0]
+        original_index = normalized_localities.index(best_match_normalized)
+        official_name = localities[original_index]
         locality_data = MALTA_LOCALITIES[official_name]
-        return {
-            "location": official_name,
-            "postcode": locality_data["postcode"],
-            "region": locality_data["region"],
-            "phonetic": locality_data["phonetic"],
-            "confidence": 95,
-            "recommendation": "Confirm location with user",
-        }
 
-    # Fuzzy matching
-    localities = list(MALTA_LOCALITIES.keys())
-    normalized_localities = [normalize_maltese(loc) for loc in localities]
+        confidence = int(score)
 
-    matches = process.extract(
-        normalized_input,
-        normalized_localities,
-        scorer=fuzz.TokenSetRatio,
-        limit=5,
-        score_cutoff=50,
-    )
+        # If confidence is low, return candidates
+        if confidence < 70:
+            # Get top 3 unique candidates
+            seen = set()
+            candidates = []
+            for match_norm, match_score in all_matches:
+                idx = normalized_localities.index(match_norm)
+                loc_name = localities[idx]
+                if loc_name not in seen:
+                    seen.add(loc_name)
+                    candidates.append(
+                        {
+                            "location": loc_name,
+                            "postcode": MALTA_LOCALITIES[loc_name]["postcode"],
+                            "region": MALTA_LOCALITIES[loc_name]["region"],
+                            "score": int(match_score),
+                        }
+                    )
+                if len(candidates) >= 3:
+                    break
 
-    jw_matches = process.extract(
-        normalized_input,
-        normalized_localities,
-        scorer=fuzz.JaroWinkler,
-        limit=5,
-        score_cutoff=50,
-    )
+            return jsonify(
+                {
+                    "location": None,
+                    "confidence": confidence,
+                    "stt_confidence": stt_confidence,
+                    "top_candidates": candidates,
+                    "recommendation": "Ask user to clarify from candidates",
+                    "message": f"Did you mean {candidates[0]['location']}, {candidates[1]['location']}, or {candidates[2]['location']}?",
+                }
+            )
 
-    all_matches = matches + jw_matches
+        # CONTEXT-AWARE DISAMBIGUATION
+        # If context hints point to Marsaskala, prefer it
+        if "geographic_hint" in context:
+            hint = context["geographic_hint"].lower()
+            if any(
+                word in hint
+                for word in [
+                    "coast",
+                    "water",
+                    "south",
+                    "sea",
+                    "fish",
+                    "restaurant",
+                    "waterfront",
+                ]
+            ):
+                # Geographic hint suggests Marsaskala (coastal)
+                if official_name == "Marsa":
+                    official_name = "Marsaskala"
+                    locality_data = MALTA_LOCALITIES["Marsaskala"]
 
-    if not all_matches:
-        return {"location": None, "confidence": 0, "message": "No locations found"}
+        # SPECIAL HANDLING: Marsa vs Marsaskala Disambiguation
+        # If user said something like "Marcela/Marsha/Marsau" and best match is "Marsa",
+        # check if "Marsaskala" might be what they meant
+        if official_name == "Marsa" and normalized_input.startswith("mar"):
+            # Check Marsaskala score
+            marsaskala_norm = normalize_maltese("Marsaskala")
+            marsaskala_score = fuzz.TokenSetRatio(normalized_input, marsaskala_norm)
+            jw_score = fuzz.JaroWinkler(normalized_input, marsaskala_norm)
+            marsaskala_confidence = int(max(marsaskala_score, jw_score))
 
-    # Get best match
-    best_match_normalized, score = all_matches[0]
-    original_index = normalized_localities.index(best_match_normalized)
-    official_name = localities[original_index]
-    locality_data = MALTA_LOCALITIES[official_name]
-
-    confidence = int(score)
-
-    # Low confidence - return candidates
-    if confidence < 70:
-        seen = set()
-        candidates = []
-        for match_norm, match_score in all_matches:
-            idx = normalized_localities.index(match_norm)
-            loc_name = localities[idx]
-            if loc_name not in seen:
-                seen.add(loc_name)
-                candidates.append(
-                    {
-                        "location": loc_name,
-                        "postcode": MALTA_LOCALITIES[loc_name]["postcode"],
-                        "region": MALTA_LOCALITIES[loc_name]["region"],
-                        "score": int(match_score),
-                    }
-                )
-            if len(candidates) >= 3:
-                break
-
-        return {
-            "location": None,
-            "confidence": confidence,
-            "top_candidates": candidates,
-            "recommendation": "Ask user to clarify from candidates",
-            "message": f"Did you mean {candidates[0]['location']}, {candidates[1]['location']}, or {candidates[2]['location']}?",
-        }
-
-    # Context-aware disambiguation
-    if "geographic_hint" in context:
-        hint = context["geographic_hint"].lower()
-        if any(
-            word in hint
-            for word in [
-                "coast",
-                "water",
-                "south",
-                "sea",
-                "fish",
-                "restaurant",
-                "waterfront",
-            ]
-        ):
-            if official_name == "Marsa":
+            # If Marsaskala is very close in score, prefer it (more likely for "Marcela" inputs)
+            if marsaskala_confidence > confidence - 5:  # Within 5% points
                 official_name = "Marsaskala"
                 locality_data = MALTA_LOCALITIES["Marsaskala"]
+                confidence = marsaskala_confidence
 
-    # Marsa vs Marsaskala special handling
-    if official_name == "Marsa" and normalized_input.startswith("mar"):
-        marsaskala_norm = normalize_maltese("Marsaskala")
-        marsaskala_score = fuzz.TokenSetRatio(normalized_input, marsaskala_norm)
-        jw_score = fuzz.JaroWinkler(normalized_input, marsaskala_norm)
-        marsaskala_confidence = int(max(marsaskala_score, jw_score))
+        # High confidence match
+        return jsonify(
+            {
+                "location": official_name,
+                "postcode": locality_data["postcode"],
+                "region": locality_data["region"],
+                "phonetic": locality_data["phonetic"],
+                "confidence": confidence,
+                "stt_confidence": stt_confidence,
+                "recommendation": "Confirm location with user"
+                if confidence >= 85
+                else "Ask for confirmation",
+            }
+        )
 
-        if marsaskala_confidence > confidence - 5:
-            official_name = "Marsaskala"
-            locality_data = MALTA_LOCALITIES["Marsaskala"]
-            confidence = marsaskala_confidence
-
-    return {
-        "location": official_name,
-        "postcode": locality_data["postcode"],
-        "region": locality_data["region"],
-        "phonetic": locality_data["phonetic"],
-        "confidence": confidence,
-        "recommendation": "Confirm location with user"
-        if confidence >= 85
-        else "Ask for confirmation",
-    }
+    except Exception as e:
+        return jsonify({"error": str(e), "error_type": type(e).__name__}), 500
 
 
-# Example usage
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(
+        {
+            "status": "healthy",
+            "service": "Maltese Location Fuzzy Matcher",
+            "localities_loaded": len(MALTA_LOCALITIES),
+        }
+    ), 200
+
+
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify(
+        {
+            "message": "Maltese Location Fuzzy Matching API",
+            "endpoints": {
+                "health": "/health",
+                "fuzzy_match": "/api/fuzzy-match-location (POST)",
+            },
+            "localities": len(MALTA_LOCALITIES),
+        }
+    ), 200
+
+
 if __name__ == "__main__":
-    # Test cases
-    test_inputs = [
-        ("Valletta", {}),
-        ("Shamsia", {}),
-        ("Marsa", {"geographic_hint": "coast"}),
-        ("Zabbar", {}),
-    ]
-
-    for user_input, context in test_inputs:
-        result = fuzzy_match_location(user_input, context)
-        print(f"Input: '{user_input}' -> {json.dumps(result, indent=2)}\n")
+    app.run(debug=False, host="0.0.0.0", port=5000)
